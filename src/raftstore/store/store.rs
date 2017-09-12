@@ -1813,32 +1813,86 @@ impl<T: Transport, C: PdClient> Store<T, C> {
         epoch: metapb::RegionEpoch,
         split_key: Vec<u8>,
     ) {
+        self.on_split_region(split_key, Some(region_id), Some(epoch), None);
+    }
+
+    fn on_split_region(
+        &mut self,
+        split_key: Vec<u8>,
+        region_id: Option<u64>,
+        epoch: Option<metapb::RegionEpoch>,
+        cb: Option<Callback>,
+    ) {
+        let region_id = match region_id {
+            Some(id) => id,
+            None => match self.region_ranges
+                .range((Excluded(split_key.clone()), Unbounded::<Key>))
+                .next()
+            {
+                Some((_, id)) => *id,
+                None => *self.region_ranges.values().last().unwrap(),
+            },
+        };
+
         if split_key.is_empty() {
             error!("[region {}] split key should not be empty!!!", region_id);
+            cb.map(|cb| {
+                cb(new_error(box_err!(
+                    "[region {}] split key should not be empty",
+                    region_id
+                )))
+            });
             return;
         }
-        let p = self.region_peers.get(&region_id);
-        if p.is_none() || !p.unwrap().is_leader() {
-            // region on this store is no longer leader, skipped.
-            info!(
-                "[region {}] region on {} doesn't exist or is not leader, skip.",
-                region_id,
-                self.store_id()
-            );
-            return;
-        }
+        let peer = match self.region_peers.get(&region_id) {
+            None => {
+                error!(
+                    "[region {}] region on {} doesn't exist, skip.",
+                    region_id,
+                    self.store_id()
+                );
+                cb.map(|cb| cb(new_error(Error::RegionNotFound(region_id))));
+                return;
+            }
+            Some(peer) => {
+                if !peer.is_leader() {
+                    // region on this store is no longer leader, skipped.
+                    error!(
+                        "[region {}] region on {} is not leader, skip.",
+                        region_id,
+                        self.store_id()
+                    );
+                    cb.map(|cb| {
+                        cb(new_error(
+                            Error::NotLeader(region_id, Some(peer.peer.clone())),
+                        ))
+                    });
+                    return;
+                }
+                peer
+            }
+        };
 
-        let peer = p.unwrap();
         let region = peer.region();
 
-        if region.get_region_epoch().get_version() != epoch.get_version() {
-            info!(
-                "{} epoch changed {:?} != {:?}, need re-check later",
-                peer.tag,
-                region.get_region_epoch(),
-                epoch
-            );
-            return;
+        if let Some(epoch) = epoch {
+            if region.get_region_epoch().get_version() != epoch.get_version() {
+                error!(
+                    "{} epoch changed {:?} != {:?}, need re-check later",
+                    peer.tag,
+                    region.get_region_epoch(),
+                    epoch
+                );
+                cb.map(|cb| {
+                    cb(new_error(box_err!(
+                        "{} epoch changed {:?} != {:?}, need re-check later",
+                        peer.tag,
+                        region.get_region_epoch(),
+                        epoch
+                    )))
+                });
+                return;
+            }
         }
 
         let key = keys::origin_key(&split_key);
@@ -2402,6 +2456,12 @@ impl<T: Transport, C: PdClient> mio::Handler for Store<T, C> {
                 hash,
             } => {
                 self.on_hash_computed(region_id, index, hash);
+            }
+            Msg::SplitRegion {
+                split_key,
+                callback,
+            } => {
+                self.on_split_region(split_key, None, None, Some(callback));
             }
         }
     }
